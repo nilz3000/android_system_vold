@@ -76,6 +76,18 @@ interface IVold {
     FileDescriptor mountAppFuse(int uid, int mountId);
     void unmountAppFuse(int uid, int mountId);
 
+    void fdeCheckPassword(@utf8InCpp String password);
+    void fdeRestart();
+    int fdeComplete();
+    void fdeEnable(int passwordType, @utf8InCpp String password, int encryptionFlags);
+    void fdeChangePassword(int passwordType, @utf8InCpp String currentPassword, @utf8InCpp String password);
+    void fdeVerifyPassword(@utf8InCpp String password);
+    @utf8InCpp String fdeGetField(@utf8InCpp String key);
+    void fdeSetField(@utf8InCpp String key, @utf8InCpp String value);
+    int fdeGetPasswordType();
+    @utf8InCpp String fdeGetPassword();
+    void fdeClearPassword();
+
     void fbeEnable();
 
     void initUser0();
