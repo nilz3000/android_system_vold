@@ -222,13 +222,14 @@ static std::vector<std::string> key_dirs_to_commit;
 
 // Replaces |dir|/keymaster_key_blob with |dir|/keymaster_key_blob_upgraded and
 // deletes the old key from Keystore.
-static bool CommitUpgradedKey(Keystore& keystore, const std::string& dir) {
-    auto blob_file = dir + "/" + kFn_keymaster_key_blob;
-    auto upgraded_blob_file = dir + "/" + kFn_keymaster_key_blob_upgraded;
+//static bool CommitUpgradedKey(Keystore& keystore, const std::string& dir) {
+//    auto blob_file = dir + "/" + kFn_keymaster_key_blob;
+//    auto upgraded_blob_file = dir + "/" + kFn_keymaster_key_blob_upgraded;
 
-    std::string blob;
-    if (!readFileToString(blob_file, &blob)) return false;
+//     std::string blob;
+//     if (!readFileToString(blob_file, &blob)) return false;
 
+/*
     if (rename(upgraded_blob_file.c_str(), blob_file.c_str()) != 0) {
         PLOG(ERROR) << "Failed to rename " << upgraded_blob_file << " to " << blob_file;
         return false;
@@ -259,29 +260,30 @@ static void DeferredCommitKeys() {
     }
     key_dirs_to_commit.clear();
 }
+*/
 
 // Returns true if the Keystore key in |dir| has already been upgraded and is
 // pending being committed.  Assumes that key_upgrade_lock is held.
-static bool IsKeyCommitPending(const std::string& dir) {
-    for (const auto& dir_to_commit : key_dirs_to_commit) {
-        if (IsSameFile(dir, dir_to_commit)) return true;
-    }
-    return false;
-}
+// static bool IsKeyCommitPending(const std::string& dir) {
+//     for (const auto& dir_to_commit : key_dirs_to_commit) {
+//         if (IsSameFile(dir, dir_to_commit)) return true;
+//     }
+//     return false;
+// }
 
 // Schedules the upgraded Keystore key in |dir| to be committed later.  Assumes
 // that key_upgrade_lock is held and that a commit isn't already pending for the
 // directory.
-static void ScheduleKeyCommit(const std::string& dir) {
-    if (key_dirs_to_commit.empty()) std::thread(DeferredCommitKeys).detach();
-    key_dirs_to_commit.push_back(dir);
-}
+//static void ScheduleKeyCommit(const std::string& dir) {
+//    if (key_dirs_to_commit.empty()) std::thread(DeferredCommitKeys).detach();
+//    key_dirs_to_commit.push_back(dir);
+//}
 
 static void CancelPendingKeyCommit(const std::string& dir) {
     std::lock_guard<std::mutex> lock(key_upgrade_lock);
     for (auto it = key_dirs_to_commit.begin(); it != key_dirs_to_commit.end(); it++) {
         if (IsSameFile(*it, dir)) {
-            LOG(DEBUG) << "Cancelling pending commit of upgraded key " << dir
+            LOG(INFO) << "Cancelling pending commit of upgraded key " << dir
                        << " because it is being destroyed";
             key_dirs_to_commit.erase(it);
             break;
@@ -314,6 +316,7 @@ bool RenameKeyDir(const std::string& old_name, const std::string& new_name) {
 // Deletes a leftover upgraded key, if present.  An upgraded key can be left
 // over if an update failed, or if we rebooted before committing the key in a
 // freak accident.  Either way, we can re-upgrade the key if we need to.
+/*
 static void DeleteUpgradedKey(Keystore& keystore, const std::string& path) {
     if (pathExists(path)) {
         LOG(DEBUG) << "Deleting leftover upgraded key " << path;
@@ -331,6 +334,7 @@ static void DeleteUpgradedKey(Keystore& keystore, const std::string& path) {
         }
     }
 }
+*/
 
 // Begins a Keystore operation using the key stored in |dir|.
 static KeystoreOperation BeginKeystoreOp(Keystore& keystore, const std::string& dir,
@@ -341,44 +345,51 @@ static KeystoreOperation BeginKeystoreOp(Keystore& keystore, const std::string& 
     inParams.append(opParams.begin(), opParams.end());
 
     auto blob_file = dir + "/" + kFn_keymaster_key_blob;
-    auto upgraded_blob_file = dir + "/" + kFn_keymaster_key_blob_upgraded;
-
+    LOG(INFO) << "reading blob_file: " << blob_file;
+    std::string blob_dir(kFn_keymaster_key_blob);
+    std::string temp_dir = "/tmp/" + blob_dir + "/";
+    if (TEMP_FAILURE_RETRY(mkdir(temp_dir.c_str(), 0700)) == -1) {
+        PLOG(ERROR) << "key mkdir " << temp_dir;
+    }
+    auto upgraded_blob_file = temp_dir + kFn_keymaster_key_blob;
+    // auto upgraded_blob_file = dir + "/" + kFn_keymaster_key_blob_upgraded;
     std::lock_guard<std::mutex> lock(key_upgrade_lock);
 
     std::string blob;
-    bool already_upgraded = IsKeyCommitPending(dir);
-    if (already_upgraded) {
-        LOG(DEBUG)
-                << blob_file
-                << " was already upgraded and is waiting to be committed; using the upgraded blob";
-        if (!readFileToString(upgraded_blob_file, &blob)) return KeystoreOperation();
-    } else {
-        DeleteUpgradedKey(keystore, upgraded_blob_file);
+    //bool already_upgraded = IsKeyCommitPending(dir);
+    //if (already_upgraded) {
+    //    LOG(DEBUG)
+    //            << blob_file
+    //            << " was already upgraded and is waiting to be committed; using the upgraded blob";
+    //    if (!readFileToString(upgraded_blob_file, &blob)) return KeystoreOperation();
+    //} else {
+    //    DeleteUpgradedKey(keystore, upgraded_blob_file);
         if (!readFileToString(blob_file, &blob)) return KeystoreOperation();
-    }
+    //}
 
     auto opHandle = keystore.begin(blob, inParams, outParams);
     if (!opHandle) return opHandle;
 
     // If key blob wasn't upgraded, nothing left to do.
-    if (!opHandle.getUpgradedBlob()) return opHandle;
+    // if (!opHandle.getUpgradedBlob()) return opHandle;
 
-    if (already_upgraded) {
-        LOG(ERROR) << "Unexpected case; already-upgraded key " << upgraded_blob_file
-                   << " still requires upgrade";
-        return KeystoreOperation();
-    }
+    //if (already_upgraded) {
+    //    LOG(ERROR) << "Unexpected case; already-upgraded key " << upgraded_blob_file
+    //               << " still requires upgrade";
+    //    return KeystoreOperation();
+    //}
     LOG(INFO) << "Upgrading key: " << blob_file;
+    
     if (!writeStringToFile(*opHandle.getUpgradedBlob(), upgraded_blob_file))
         return KeystoreOperation();
-    if (cp_needsCheckpoint()) {
-        LOG(INFO) << "Wrote upgraded key to " << upgraded_blob_file
-                  << "; delaying commit due to checkpoint";
-        ScheduleKeyCommit(dir);
-    } else {
-        if (!CommitUpgradedKey(keystore, dir)) return KeystoreOperation();
-        LOG(INFO) << "Key upgraded: " << blob_file;
-    }
+    //if (cp_needsCheckpoint()) {
+    //    LOG(INFO) << "Wrote upgraded key to " << upgraded_blob_file
+    //              << "; delaying commit due to checkpoint";
+    //    ScheduleKeyCommit(dir);
+    //} else {
+    //    if (!CommitUpgradedKey(keystore, dir)) return KeystoreOperation();
+    //    LOG(INFO) << "Key upgraded: " << blob_file;
+    //}
     return opHandle;
 }
 
@@ -623,7 +634,7 @@ bool storeKeyAtomically(const std::string& key_path, const std::string& tmp_path
         return false;
     }
     if (pathExists(tmp_path)) {
-        LOG(DEBUG) << "Already exists, destroying: " << tmp_path;
+        LOG(INFO) << "Already exists, destroying: " << tmp_path;
         destroyKey(tmp_path);  // May be partially created so ignore errors
     }
     if (!storeKey(tmp_path, auth, key)) return false;
@@ -631,11 +642,12 @@ bool storeKeyAtomically(const std::string& key_path, const std::string& tmp_path
     if (!RenameKeyDir(tmp_path, key_path)) return false;
 
     if (!FsyncParentDirectory(key_path)) return false;
-    LOG(DEBUG) << "Created key: " << key_path;
+    LOG(INFO) << "Created key: " << key_path;
     return true;
 }
 
 bool retrieveKey(const std::string& dir, const KeyAuthentication& auth, KeyBuffer* key) {
+    LOG(INFO) << "Retrieving key from keymaster";
     std::string version;
     if (!readFileToString(dir + "/" + kFn_version, &version)) return false;
     if (version != kCurrentVersion) {
