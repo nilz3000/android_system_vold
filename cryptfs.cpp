@@ -262,6 +262,9 @@ static struct crypt_persist_data* persist_data = NULL;
 
 static int previous_type;
 
+static char twrp_key_fname[PROPERTY_VALUE_MAX] = "";
+static char twrp_real_blkdev[PROPERTY_VALUE_MAX] = "";
+
 #ifdef CONFIG_HW_DISK_ENCRYPTION
 static int scrypt_keymaster(const char *passwd, const unsigned char *salt,
                             unsigned char *ikey, void *params);
@@ -429,6 +432,811 @@ static const CryptoType& get_crypto_type() {
 
 const KeyGeneration cryptfs_get_keygen() {
     return KeyGeneration{get_crypto_type().get_keysize(), true, false};
+}
+
+static bool write_string_to_buf(const std::string& towrite, uint8_t* buffer, uint32_t buffer_size,
+                                uint32_t* out_size) {
+    if (!buffer || !out_size) {
+        LOG(ERROR) << "Missing target pointers";
+        return false;
+    }
+    *out_size = towrite.size();
+    if (buffer_size < towrite.size()) {
+        LOG(ERROR) << "Buffer too small " << buffer_size << " < " << towrite.size();
+        return false;
+    }
+    memset(buffer, '\0', buffer_size);
+    std::copy(towrite.begin(), towrite.end(), buffer);
+    return true;
+}
+
+static int keymaster_create_key_for_cryptfs_scrypt(uint32_t rsa_key_size, uint64_t rsa_exponent,
+                                                   uint32_t ratelimit, uint8_t* key_buffer,
+                                                   uint32_t key_buffer_size,
+                                                   uint32_t* key_out_size) {
+    if (key_out_size) {
+        *key_out_size = 0;
+    }
+    Keymaster dev;
+    if (!dev) {
+        LOG(ERROR) << "Failed to initiate keymaster session";
+        return -1;
+    }
+    auto keyParams = km::AuthorizationSetBuilder()
+                             .RsaSigningKey(rsa_key_size, rsa_exponent)
+                             .NoDigestOrPadding()
+                             .Authorization(km::TAG_NO_AUTH_REQUIRED)
+                             .Authorization(km::TAG_MIN_SECONDS_BETWEEN_OPS, ratelimit);
+    std::string key;
+    if (!dev.generateKey(keyParams, &key)) return -1;
+    if (!write_string_to_buf(key, key_buffer, key_buffer_size, key_out_size)) return -1;
+    return 0;
+}
+
+/* Create a new keymaster key and store it in this footer */
+static int keymaster_create_key(struct crypt_mnt_ftr* ftr) {
+    if (ftr->keymaster_blob_size) {
+        SLOGI("Already have key");
+        return 0;
+    }
+
+    int rc = keymaster_create_key_for_cryptfs_scrypt(
+        RSA_KEY_SIZE, RSA_EXPONENT, KEYMASTER_CRYPTFS_RATE_LIMIT, ftr->keymaster_blob,
+        KEYMASTER_BLOB_SIZE, &ftr->keymaster_blob_size);
+    if (rc) {
+        if (ftr->keymaster_blob_size > KEYMASTER_BLOB_SIZE) {
+            SLOGE("Keymaster key blob too large");
+            ftr->keymaster_blob_size = 0;
+        }
+        SLOGE("Failed to generate keypair");
+        return -1;
+    }
+    return 0;
+}
+
+static int keymaster_sign_object_for_cryptfs_scrypt(struct crypt_mnt_ftr* ftr, uint32_t ratelimit,
+                                                    const uint8_t* object, const size_t object_size,
+                                                    uint8_t** signature_buffer,
+                                                    size_t* signature_buffer_size) {
+    if (!object || !signature_buffer || !signature_buffer_size) {
+        LOG(ERROR) << __FILE__ << ":" << __LINE__ << ":Invalid argument";
+        return -1;
+    }
+
+    Keymaster dev;
+    if (!dev) {
+        LOG(ERROR) << "Failed to initiate keymaster session";
+        return -1;
+    }
+
+    km::AuthorizationSet outParams;
+    std::string key(reinterpret_cast<const char*>(ftr->keymaster_blob), ftr->keymaster_blob_size);
+    std::string input(reinterpret_cast<const char*>(object), object_size);
+    std::string output;
+    KeymasterOperation op;
+
+    auto paramBuilder = km::AuthorizationSetBuilder().NoDigestOrPadding().Authorization(
+            km::TAG_PURPOSE, km::KeyPurpose::SIGN);
+    while (true) {
+        op = dev.begin(key, paramBuilder, &outParams);
+        if (op.getErrorCode() == km::ErrorCode::KEY_RATE_LIMIT_EXCEEDED) {
+            sleep(ratelimit);
+            continue;
+        } else
+            break;
+    }
+
+    if (!op) {
+        LOG(ERROR) << "Error starting keymaster signature transaction: "
+                   << int32_t(op.getErrorCode());
+        return -1;
+    }
+
+    if (op.getUpgradedBlob()) {
+        write_string_to_buf(*op.getUpgradedBlob(), ftr->keymaster_blob, KEYMASTER_BLOB_SIZE,
+                            &ftr->keymaster_blob_size);
+
+        SLOGD("Upgrading key");
+        if (put_crypt_ftr_and_key(ftr) != 0) {
+            SLOGE("Failed to write upgraded key to disk");
+            return -1;
+        }
+        SLOGD("Key upgraded successfully");
+    }
+
+    if (!op.updateCompletely(input, &output)) {
+        LOG(ERROR) << "Error sending data to keymaster signature transaction: "
+                   << int32_t(op.getErrorCode());
+        return -1;
+    }
+
+    if (!op.finish(&output)) {
+        LOG(ERROR) << "Error finalizing keymaster signature transaction: "
+                   << int32_t(op.getErrorCode());
+        return -1;
+    }
+
+    *signature_buffer = reinterpret_cast<uint8_t*>(malloc(output.size()));
+    if (*signature_buffer == nullptr) {
+        LOG(ERROR) << "Error allocation buffer for keymaster signature";
+        return -1;
+    }
+    *signature_buffer_size = output.size();
+    std::copy(output.data(), output.data() + output.size(), *signature_buffer);
+
+    return 0;
+}
+
+void set_partition_data(const char* block_device, const char* key_location)
+{
+  strncpy(twrp_key_fname, key_location, strlen(key_location));
+  strncpy(twrp_real_blkdev, block_device, strlen(block_device));
+}
+
+/* This signs the given object using the keymaster key. */
+static int keymaster_sign_object(struct crypt_mnt_ftr* ftr, const unsigned char* object,
+                                 const size_t object_size, unsigned char** signature,
+                                 size_t* signature_size) {
+    unsigned char to_sign[RSA_KEY_SIZE_BYTES];
+    size_t to_sign_size = sizeof(to_sign);
+    memset(to_sign, 0, RSA_KEY_SIZE_BYTES);
+
+    // To sign a message with RSA, the message must satisfy two
+    // constraints:
+    //
+    // 1. The message, when interpreted as a big-endian numeric value, must
+    //    be strictly less than the public modulus of the RSA key.  Note
+    //    that because the most significant bit of the public modulus is
+    //    guaranteed to be 1 (else it's an (n-1)-bit key, not an n-bit
+    //    key), an n-bit message with most significant bit 0 always
+    //    satisfies this requirement.
+    //
+    // 2. The message must have the same length in bits as the public
+    //    modulus of the RSA key.  This requirement isn't mathematically
+    //    necessary, but is necessary to ensure consistency in
+    //    implementations.
+    switch (ftr->kdf_type) {
+        case KDF_SCRYPT_KEYMASTER:
+            // This ensures the most significant byte of the signed message
+            // is zero.  We could have zero-padded to the left instead, but
+            // this approach is slightly more robust against changes in
+            // object size.  However, it's still broken (but not unusably
+            // so) because we really should be using a proper deterministic
+            // RSA padding function, such as PKCS1.
+            memcpy(to_sign + 1, object, std::min((size_t)RSA_KEY_SIZE_BYTES - 1, object_size));
+            SLOGI("Signing safely-padded object");
+            break;
+        default:
+            SLOGE("Unknown KDF type %d", ftr->kdf_type);
+            return -1;
+    }
+    return keymaster_sign_object_for_cryptfs_scrypt(ftr, KEYMASTER_CRYPTFS_RATE_LIMIT, to_sign,
+                                                    to_sign_size, signature, signature_size);
+}
+
+/* Store password when userdata is successfully decrypted and mounted.
+ * Cleared by cryptfs_clear_password
+ *
+ * To avoid a double prompt at boot, we need to store the CryptKeeper
+ * password and pass it to KeyGuard, which uses it to unlock KeyStore.
+ * Since the entire framework is torn down and rebuilt after encryption,
+ * we have to use a daemon or similar to store the password. Since vold
+ * is secured against IPC except from system processes, it seems a reasonable
+ * place to store this.
+ *
+ * password should be cleared once it has been used.
+ *
+ * password is aged out after password_max_age_seconds seconds.
+ */
+static char* password = 0;
+static int password_expiry_time = 0;
+static const int password_max_age_seconds = 60;
+
+enum class RebootType { reboot, recovery, shutdown };
+static void cryptfs_reboot(RebootType rt) {
+    switch (rt) {
+        case RebootType::reboot:
+            property_set(ANDROID_RB_PROPERTY, "reboot");
+            break;
+
+        case RebootType::recovery:
+            property_set(ANDROID_RB_PROPERTY, "reboot,recovery");
+            break;
+
+        case RebootType::shutdown:
+            property_set(ANDROID_RB_PROPERTY, "shutdown");
+            break;
+    }
+
+    sleep(20);
+
+    /* Shouldn't get here, reboot should happen before sleep times out */
+    return;
+}
+
+/**
+ * Gets the default device scrypt parameters for key derivation time tuning.
+ * The parameters should lead to about one second derivation time for the
+ * given device.
+ */
+static void get_device_scrypt_params(struct crypt_mnt_ftr* ftr) {
+    char paramstr[PROPERTY_VALUE_MAX];
+    int Nf, rf, pf;
+
+    property_get(SCRYPT_PROP, paramstr, SCRYPT_DEFAULTS);
+    if (!parse_scrypt_parameters(paramstr, &Nf, &rf, &pf)) {
+        SLOGW("bad scrypt parameters '%s' should be like '12:8:1'; using defaults", paramstr);
+        parse_scrypt_parameters(SCRYPT_DEFAULTS, &Nf, &rf, &pf);
+    }
+    ftr->N_factor = Nf;
+    ftr->r_factor = rf;
+    ftr->p_factor = pf;
+}
+
+static uint64_t get_fs_size(const char* dev) {
+    int fd, block_size;
+    struct ext4_super_block sb;
+    uint64_t len;
+
+    if ((fd = open(dev, O_RDONLY | O_CLOEXEC)) < 0) {
+        SLOGE("Cannot open device to get filesystem size ");
+        return 0;
+    }
+
+    if (lseek64(fd, 1024, SEEK_SET) < 0) {
+        SLOGE("Cannot seek to superblock");
+        return 0;
+    }
+
+    if (read(fd, &sb, sizeof(sb)) != sizeof(sb)) {
+        SLOGE("Cannot read superblock");
+        return 0;
+    }
+
+    close(fd);
+
+    if (le32_to_cpu(sb.s_magic) != EXT4_SUPER_MAGIC) {
+        SLOGE("Not a valid ext4 superblock");
+        return 0;
+    }
+    block_size = 1024 << sb.s_log_block_size;
+    /* compute length in bytes */
+    len = (((uint64_t)sb.s_blocks_count_hi << 32) + sb.s_blocks_count_lo) * block_size;
+
+    /* return length in sectors */
+    return len / 512;
+}
+
+static void get_crypt_info(std::string* key_loc, std::string* real_blk_device) {
+    /*
+    for (const auto& entry : fstab_default) {
+        if (!entry.fs_mgr_flags.vold_managed &&
+            (entry.fs_mgr_flags.crypt || entry.fs_mgr_flags.force_crypt ||
+             entry.fs_mgr_flags.force_fde_or_fbe || entry.fs_mgr_flags.file_encryption)) {
+            if (key_loc != nullptr) {
+                *key_loc = entry.key_loc;
+            }
+            if (real_blk_device != nullptr) {
+                *real_blk_device = entry.blk_device;
+            }
+            return;
+        }
+    }
+    */
+    if (key_loc != nullptr) {
+        *key_loc = std::string(twrp_key_fname);
+    }
+    if (real_blk_device != nullptr) {
+        *real_blk_device = std::string(twrp_real_blkdev);
+    }
+    return;
+}
+
+static int get_crypt_ftr_info(char** metadata_fname, off64_t* off) {
+    static int cached_data = 0;
+    static uint64_t cached_off = 0;
+    static char cached_metadata_fname[PROPERTY_VALUE_MAX] = "";
+    char key_loc[PROPERTY_VALUE_MAX];
+    char real_blkdev[PROPERTY_VALUE_MAX];
+    int rc = -1;
+
+    if (!cached_data) {
+        std::string key_loc;
+        std::string real_blkdev;
+        get_crypt_info(&key_loc, &real_blkdev);
+
+        if (key_loc == KEY_IN_FOOTER) {
+            if (android::vold::GetBlockDevSize(real_blkdev, &cached_off) == android::OK) {
+                /* If it's an encrypted Android partition, the last 16 Kbytes contain the
+                 * encryption info footer and key, and plenty of bytes to spare for future
+                 * growth.
+                 */
+                strlcpy(cached_metadata_fname, real_blkdev.c_str(), sizeof(cached_metadata_fname));
+                cached_off -= CRYPT_FOOTER_OFFSET;
+                cached_data = 1;
+            } else {
+                SLOGE("Cannot get size of block device %s\n", real_blkdev.c_str());
+            }
+        } else {
+            strlcpy(cached_metadata_fname, key_loc.c_str(), sizeof(cached_metadata_fname));
+            cached_off = 0;
+            cached_data = 1;
+        }
+    }
+
+    if (cached_data) {
+        if (metadata_fname) {
+            *metadata_fname = cached_metadata_fname;
+        }
+        if (off) {
+            *off = cached_off;
+        }
+        rc = 0;
+    }
+
+    return rc;
+}
+
+/* Set sha256 checksum in structure */
+static void set_ftr_sha(struct crypt_mnt_ftr* crypt_ftr) {
+    SHA256_CTX c;
+    SHA256_Init(&c);
+    memset(crypt_ftr->sha256, 0, sizeof(crypt_ftr->sha256));
+    SHA256_Update(&c, crypt_ftr, sizeof(*crypt_ftr));
+    SHA256_Final(crypt_ftr->sha256, &c);
+}
+
+/* key or salt can be NULL, in which case just skip writing that value.  Useful to
+ * update the failed mount count but not change the key.
+ */
+static int put_crypt_ftr_and_key(struct crypt_mnt_ftr* crypt_ftr) {
+    int fd;
+    unsigned int cnt;
+    /* starting_off is set to the SEEK_SET offset
+     * where the crypto structure starts
+     */
+    off64_t starting_off;
+    int rc = -1;
+    char* fname = NULL;
+    struct stat statbuf;
+
+    set_ftr_sha(crypt_ftr);
+
+    if (get_crypt_ftr_info(&fname, &starting_off)) {
+        SLOGE("Unable to get crypt_ftr_info\n");
+        return -1;
+    }
+    if (fname[0] != '/') {
+        SLOGE("Unexpected value for crypto key location\n");
+        return -1;
+    }
+    if ((fd = open(fname, O_RDWR | O_CREAT | O_CLOEXEC, 0600)) < 0) {
+        SLOGE("Cannot open footer file %s for put\n", fname);
+        return -1;
+    }
+
+    /* Seek to the start of the crypt footer */
+    if (lseek64(fd, starting_off, SEEK_SET) == -1) {
+        SLOGE("Cannot seek to real block device footer\n");
+        goto errout;
+    }
+
+    if ((cnt = write(fd, crypt_ftr, sizeof(struct crypt_mnt_ftr))) != sizeof(struct crypt_mnt_ftr)) {
+        SLOGE("Cannot write real block device footer\n");
+        goto errout;
+    }
+
+    fstat(fd, &statbuf);
+    /* If the keys are kept on a raw block device, do not try to truncate it. */
+    if (S_ISREG(statbuf.st_mode)) {
+        if (ftruncate(fd, 0x4000)) {
+            SLOGE("Cannot set footer file size\n");
+            goto errout;
+        }
+    }
+
+    /* Success! */
+    rc = 0;
+
+errout:
+    close(fd);
+    return rc;
+}
+
+static bool check_ftr_sha(const struct crypt_mnt_ftr* crypt_ftr) {
+    struct crypt_mnt_ftr copy;
+    memcpy(&copy, crypt_ftr, sizeof(copy));
+    set_ftr_sha(&copy);
+    return memcmp(copy.sha256, crypt_ftr->sha256, sizeof(copy.sha256)) == 0;
+}
+
+static inline int unix_read(int fd, void* buff, int len) {
+    return TEMP_FAILURE_RETRY(read(fd, buff, len));
+}
+
+static inline int unix_write(int fd, const void* buff, int len) {
+    return TEMP_FAILURE_RETRY(write(fd, buff, len));
+}
+
+static void init_empty_persist_data(struct crypt_persist_data* pdata, int len) {
+    memset(pdata, 0, len);
+    pdata->persist_magic = PERSIST_DATA_MAGIC;
+    pdata->persist_valid_entries = 0;
+}
+
+/* A routine to update the passed in crypt_ftr to the lastest version.
+ * fd is open read/write on the device that holds the crypto footer and persistent
+ * data, crypt_ftr is a pointer to the struct to be updated, and offset is the
+ * absolute offset to the start of the crypt_mnt_ftr on the passed in fd.
+ */
+static void upgrade_crypt_ftr(int fd, struct crypt_mnt_ftr* crypt_ftr, off64_t offset) {
+    int orig_major = crypt_ftr->major_version;
+    int orig_minor = crypt_ftr->minor_version;
+
+    if ((crypt_ftr->major_version == 1) && (crypt_ftr->minor_version == 0)) {
+        struct crypt_persist_data* pdata;
+        off64_t pdata_offset = offset + CRYPT_FOOTER_TO_PERSIST_OFFSET;
+
+        SLOGW("upgrading crypto footer to 1.1");
+
+        pdata = (crypt_persist_data*)malloc(CRYPT_PERSIST_DATA_SIZE);
+        if (pdata == NULL) {
+            SLOGE("Cannot allocate persisent data\n");
+            return;
+        }
+        memset(pdata, 0, CRYPT_PERSIST_DATA_SIZE);
+
+        /* Need to initialize the persistent data area */
+        if (lseek64(fd, pdata_offset, SEEK_SET) == -1) {
+            SLOGE("Cannot seek to persisent data offset\n");
+            free(pdata);
+            return;
+        }
+        /* Write all zeros to the first copy, making it invalid */
+        unix_write(fd, pdata, CRYPT_PERSIST_DATA_SIZE);
+
+        /* Write a valid but empty structure to the second copy */
+        init_empty_persist_data(pdata, CRYPT_PERSIST_DATA_SIZE);
+        unix_write(fd, pdata, CRYPT_PERSIST_DATA_SIZE);
+
+        /* Update the footer */
+        crypt_ftr->persist_data_size = CRYPT_PERSIST_DATA_SIZE;
+        crypt_ftr->persist_data_offset[0] = pdata_offset;
+        crypt_ftr->persist_data_offset[1] = pdata_offset + CRYPT_PERSIST_DATA_SIZE;
+        crypt_ftr->minor_version = 1;
+        free(pdata);
+    }
+
+    if ((crypt_ftr->major_version == 1) && (crypt_ftr->minor_version == 1)) {
+        SLOGW("upgrading crypto footer to 1.2");
+        /* But keep the old kdf_type.
+         * It will get updated later to KDF_SCRYPT after the password has been verified.
+         */
+        crypt_ftr->kdf_type = KDF_PBKDF2;
+        get_device_scrypt_params(crypt_ftr);
+        crypt_ftr->minor_version = 2;
+    }
+
+    if ((crypt_ftr->major_version == 1) && (crypt_ftr->minor_version == 2)) {
+        SLOGW("upgrading crypto footer to 1.3");
+        crypt_ftr->crypt_type = CRYPT_TYPE_PASSWORD;
+        crypt_ftr->minor_version = 3;
+    }
+
+    if ((orig_major != crypt_ftr->major_version) || (orig_minor != crypt_ftr->minor_version)) {
+        if (lseek64(fd, offset, SEEK_SET) == -1) {
+            SLOGE("Cannot seek to crypt footer\n");
+            return;
+        }
+        unix_write(fd, crypt_ftr, sizeof(struct crypt_mnt_ftr));
+    }
+}
+
+static int get_crypt_ftr_and_key(struct crypt_mnt_ftr* crypt_ftr) {
+    int fd;
+    unsigned int cnt;
+    off64_t starting_off;
+    int rc = -1;
+    char* fname = NULL;
+    struct stat statbuf;
+
+    if (get_crypt_ftr_info(&fname, &starting_off)) {
+        SLOGE("Unable to get crypt_ftr_info\n");
+        return -1;
+    }
+    if (fname[0] != '/') {
+        SLOGE("Unexpected value for crypto key location\n");
+        return -1;
+    }
+    if ((fd = open(fname, O_RDWR | O_CLOEXEC)) < 0) {
+        SLOGE("Cannot open footer file %s for get\n", fname);
+        return -1;
+    }
+
+    /* Make sure it's 16 Kbytes in length */
+    fstat(fd, &statbuf);
+    if (S_ISREG(statbuf.st_mode) && (statbuf.st_size != 0x4000)) {
+        SLOGE("footer file %s is not the expected size!\n", fname);
+        goto errout;
+    }
+
+    /* Seek to the start of the crypt footer */
+    if (lseek64(fd, starting_off, SEEK_SET) == -1) {
+        SLOGE("Cannot seek to real block device footer\n");
+        goto errout;
+    }
+
+    if ((cnt = read(fd, crypt_ftr, sizeof(struct crypt_mnt_ftr))) != sizeof(struct crypt_mnt_ftr)) {
+        SLOGE("Cannot read real block device footer\n");
+        goto errout;
+    }
+
+    if (crypt_ftr->magic != CRYPT_MNT_MAGIC) {
+        SLOGE("Bad magic for real block device %s\n", fname);
+        goto errout;
+    }
+
+    if (crypt_ftr->major_version != CURRENT_MAJOR_VERSION) {
+        SLOGE("Cannot understand major version %d real block device footer; expected %d\n",
+              crypt_ftr->major_version, CURRENT_MAJOR_VERSION);
+        goto errout;
+    }
+
+    // We risk buffer overflows with oversized keys, so we just reject them.
+    // 0-sized keys are problematic (essentially by-passing encryption), and
+    // AES-CBC key wrapping only works for multiples of 16 bytes.
+    if ((crypt_ftr->keysize == 0) || ((crypt_ftr->keysize % 16) != 0) ||
+        (crypt_ftr->keysize > MAX_KEY_LEN)) {
+        SLOGE(
+            "Invalid keysize (%u) for block device %s; Must be non-zero, "
+            "divisible by 16, and <= %d\n",
+            crypt_ftr->keysize, fname, MAX_KEY_LEN);
+        goto errout;
+    }
+
+    if (crypt_ftr->minor_version > CURRENT_MINOR_VERSION) {
+        SLOGW("Warning: crypto footer minor version %d, expected <= %d, continuing...\n",
+              crypt_ftr->minor_version, CURRENT_MINOR_VERSION);
+    }
+
+    /* If this is a verion 1.0 crypt_ftr, make it a 1.1 crypt footer, and update the
+     * copy on disk before returning.
+     */
+    if (crypt_ftr->minor_version < CURRENT_MINOR_VERSION) {
+        upgrade_crypt_ftr(fd, crypt_ftr, starting_off);
+    }
+
+    /* Success! */
+    rc = 0;
+
+errout:
+    close(fd);
+    return rc;
+}
+
+static int validate_persistent_data_storage(struct crypt_mnt_ftr* crypt_ftr) {
+    if (crypt_ftr->persist_data_offset[0] + crypt_ftr->persist_data_size >
+        crypt_ftr->persist_data_offset[1]) {
+        SLOGE("Crypt_ftr persist data regions overlap");
+        return -1;
+    }
+
+    if (crypt_ftr->persist_data_offset[0] >= crypt_ftr->persist_data_offset[1]) {
+        SLOGE("Crypt_ftr persist data region 0 starts after region 1");
+        return -1;
+    }
+
+    if (((crypt_ftr->persist_data_offset[1] + crypt_ftr->persist_data_size) -
+         (crypt_ftr->persist_data_offset[0] - CRYPT_FOOTER_TO_PERSIST_OFFSET)) >
+        CRYPT_FOOTER_OFFSET) {
+        SLOGE("Persistent data extends past crypto footer");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int load_persistent_data(void) {
+    struct crypt_mnt_ftr crypt_ftr;
+    struct crypt_persist_data* pdata = NULL;
+    char encrypted_state[PROPERTY_VALUE_MAX];
+    char* fname;
+    int found = 0;
+    int fd;
+    int ret;
+    int i;
+
+    if (persist_data) {
+        /* Nothing to do, we've already loaded or initialized it */
+        return 0;
+    }
+
+    /* If not encrypted, just allocate an empty table and initialize it */
+    property_get("ro.crypto.state", encrypted_state, "");
+    if (strcmp(encrypted_state, "encrypted")) {
+        pdata = (crypt_persist_data*)malloc(CRYPT_PERSIST_DATA_SIZE);
+        if (pdata) {
+            init_empty_persist_data(pdata, CRYPT_PERSIST_DATA_SIZE);
+            persist_data = pdata;
+            return 0;
+        }
+        return -1;
+    }
+
+    if (get_crypt_ftr_and_key(&crypt_ftr)) {
+        return -1;
+    }
+
+    if ((crypt_ftr.major_version < 1) ||
+        (crypt_ftr.major_version == 1 && crypt_ftr.minor_version < 1)) {
+        SLOGE("Crypt_ftr version doesn't support persistent data");
+        return -1;
+    }
+
+    if (get_crypt_ftr_info(&fname, NULL)) {
+        return -1;
+    }
+
+    ret = validate_persistent_data_storage(&crypt_ftr);
+    if (ret) {
+        return -1;
+    }
+
+    fd = open(fname, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        SLOGE("Cannot open %s metadata file", fname);
+        return -1;
+    }
+
+    pdata = (crypt_persist_data*)malloc(crypt_ftr.persist_data_size);
+    if (pdata == NULL) {
+        SLOGE("Cannot allocate memory for persistent data");
+        goto err;
+    }
+
+    for (i = 0; i < 2; i++) {
+        if (lseek64(fd, crypt_ftr.persist_data_offset[i], SEEK_SET) < 0) {
+            SLOGE("Cannot seek to read persistent data on %s", fname);
+            goto err2;
+        }
+        if (unix_read(fd, pdata, crypt_ftr.persist_data_size) < 0) {
+            SLOGE("Error reading persistent data on iteration %d", i);
+            goto err2;
+        }
+        if (pdata->persist_magic == PERSIST_DATA_MAGIC) {
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found) {
+        SLOGI("Could not find valid persistent data, creating");
+        init_empty_persist_data(pdata, crypt_ftr.persist_data_size);
+    }
+
+    /* Success */
+    persist_data = pdata;
+    close(fd);
+    return 0;
+
+err2:
+    free(pdata);
+
+err:
+    close(fd);
+    return -1;
+}
+
+static int save_persistent_data(void) {
+    struct crypt_mnt_ftr crypt_ftr;
+    struct crypt_persist_data* pdata;
+    char* fname;
+    off64_t write_offset;
+    off64_t erase_offset;
+    int fd;
+    int ret;
+
+    if (persist_data == NULL) {
+        SLOGE("No persistent data to save");
+        return -1;
+    }
+
+    if (get_crypt_ftr_and_key(&crypt_ftr)) {
+        return -1;
+    }
+
+    if ((crypt_ftr.major_version < 1) ||
+        (crypt_ftr.major_version == 1 && crypt_ftr.minor_version < 1)) {
+        SLOGE("Crypt_ftr version doesn't support persistent data");
+        return -1;
+    }
+
+    ret = validate_persistent_data_storage(&crypt_ftr);
+    if (ret) {
+        return -1;
+    }
+
+    if (get_crypt_ftr_info(&fname, NULL)) {
+        return -1;
+    }
+
+    fd = open(fname, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        SLOGE("Cannot open %s metadata file", fname);
+        return -1;
+    }
+
+    pdata = (crypt_persist_data*)malloc(crypt_ftr.persist_data_size);
+    if (pdata == NULL) {
+        SLOGE("Cannot allocate persistant data");
+        goto err;
+    }
+
+    if (lseek64(fd, crypt_ftr.persist_data_offset[0], SEEK_SET) < 0) {
+        SLOGE("Cannot seek to read persistent data on %s", fname);
+        goto err2;
+    }
+
+    if (unix_read(fd, pdata, crypt_ftr.persist_data_size) < 0) {
+        SLOGE("Error reading persistent data before save");
+        goto err2;
+    }
+
+    if (pdata->persist_magic == PERSIST_DATA_MAGIC) {
+        /* The first copy is the curent valid copy, so write to
+         * the second copy and erase this one */
+        write_offset = crypt_ftr.persist_data_offset[1];
+        erase_offset = crypt_ftr.persist_data_offset[0];
+    } else {
+        /* The second copy must be the valid copy, so write to
+         * the first copy, and erase the second */
+        write_offset = crypt_ftr.persist_data_offset[0];
+        erase_offset = crypt_ftr.persist_data_offset[1];
+    }
+
+    /* Write the new copy first, if successful, then erase the old copy */
+    if (lseek64(fd, write_offset, SEEK_SET) < 0) {
+        SLOGE("Cannot seek to write persistent data");
+        goto err2;
+    }
+    if (unix_write(fd, persist_data, crypt_ftr.persist_data_size) ==
+        (int)crypt_ftr.persist_data_size) {
+        if (lseek64(fd, erase_offset, SEEK_SET) < 0) {
+            SLOGE("Cannot seek to erase previous persistent data");
+            goto err2;
+        }
+        fsync(fd);
+        memset(pdata, 0, crypt_ftr.persist_data_size);
+        if (unix_write(fd, pdata, crypt_ftr.persist_data_size) != (int)crypt_ftr.persist_data_size) {
+            SLOGE("Cannot write to erase previous persistent data");
+            goto err2;
+        }
+        fsync(fd);
+    } else {
+        SLOGE("Cannot write to save persistent data");
+        goto err2;
+    }
+
+    /* Success */
+    free(pdata);
+    close(fd);
+    return 0;
+
+err2:
+    free(pdata);
+err:
+    close(fd);
+    return -1;
+}
+
+int cryptfs_check_footer()
+{
+    int rc = -1;
+    struct crypt_mnt_ftr crypt_ftr;
+
+    rc = get_crypt_ftr_and_key(&crypt_ftr);
+
+    return rc;
 }
 
 /* Convert a binary key of specified length into an ascii hex string equivalent,

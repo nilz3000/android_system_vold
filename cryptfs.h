@@ -72,4 +72,7 @@ int cryptfs_setup_ext_volume(const char* label, const char* real_blkdev,
                              const android::vold::KeyBuffer& key, std::string* out_crypto_blkdev);
 const android::vold::KeyGeneration cryptfs_get_keygen();
 
+void set_partition_data(const char* block_device, const char* key_location);
+int cryptfs_check_footer();
+
 #endif /* ANDROID_VOLD_CRYPTFS_H */
