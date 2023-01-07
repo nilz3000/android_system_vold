@@ -107,7 +107,6 @@ cc_library_static {
         "keystore2_use_latest_aidl_ndk_shared",
         "vold_hw_fde_defaults",
         "vold_hw_fde_perf_defaults",
-        "vold_defaults"
     ],
     include_dirs: [
         "system/core/gatekeeperd/include"
@@ -357,12 +356,7 @@ bootstrap_go_package {
         "soong-cc"
     ],
     srcs: [
-        "vold_defaults.go",
         "soong/makevars.go"
     ],
     pluginFor: ["soong_build"]
-}
-
-vold_defaults {
-  name: "vold_defaults"
 }
